@@ -59,6 +59,11 @@ if [ ! -x "${BIN}" ]; then
     exit 1
 fi
 
+if [ ! -f "${PROJECT_ROOT}/examples/glibc_test" ] || [ ! -f "${PROJECT_ROOT}/examples/glibc_cpp_test" ] || [ ! -f "${PROJECT_ROOT}/examples/glibc_sdl2_test" ]; then
+    printf "%bBuilding test examples...%b\n" "${CYAN}" "${RESET}"
+    make -C "${PROJECT_ROOT}" examples >/dev/null 2>&1 || true
+fi
+
 # Test 1: CLI Version & Hardware Status
 run_test "CLI Version & Environment Status" \
     "${BIN} version && ${BIN} status"

@@ -173,7 +173,7 @@ int Runner::run_namespace_engine(const Config &cfg, const std::vector<std::strin
 
     const char *skeleton_dirs[] = {
         "dev", "proc", "sys", "etc", "tmp", "run", "home", "root",
-        "usr", "usr/lib", "usr/lib32", "usr/bin", "usr/share", "usr/libexec",
+        "usr", "usr/lib", "usr/lib32", "usr/bin", "usr/share", "usr/libexec", "usr/include",
         "lib", "lib64", "lib32", "bin", "sbin", "opt", "var", "mnt", "media", NULL
     };
     for (int i = 0; skeleton_dirs[i]; i++) {
@@ -245,6 +245,16 @@ int Runner::run_namespace_engine(const Config &cfg, const std::vector<std::strin
         }
     } else {
         mount("/oldroot/usr/share", "/usr/share", NULL, MS_BIND | MS_REC, NULL);
+    }
+
+    // Overlay sysroot/usr/include with host /usr/include (C/C++ development headers)
+    if (utils::dir_exists(old_sysroot + "/usr/include")) {
+        std::string ovl_inc = "lowerdir=" + old_sysroot + "/usr/include:/oldroot/usr/include";
+        if (mount("overlay", "/usr/include", "overlay", 0, ovl_inc.c_str()) < 0) {
+            mount((old_sysroot + "/usr/include").c_str(), "/usr/include", NULL, MS_BIND | MS_REC, NULL);
+        }
+    } else {
+        mount("/oldroot/usr/include", "/usr/include", NULL, MS_BIND | MS_REC, NULL);
     }
 
     // Mount /opt if exists

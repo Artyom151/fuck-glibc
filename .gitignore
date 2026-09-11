@@ -1,0 +1,32 @@
+# Build artifacts
+/bin/
+fglibc
+*.o
+*.a
+*.so
+
+# Test & Debug executables
+examples/glibc_test
+examples/glibc_cpp_test
+examples/glibc_sdl2_test
+scratch/
+
+# Logs & temporary files
+logs/
+*.log
+*.log.gz
+/tmp/
+*.tmp
+
+# Editor & IDE metadata
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Package archives & cache artifacts
+*.pkg.tar.zst
+*.pkg.tar.xz
+*.pkg.tar.gz

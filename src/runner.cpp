@@ -13,6 +13,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <dirent.h>
 #include <cstring>
 #include <cstdlib>
 #include <iostream>
@@ -105,18 +106,22 @@ int Runner::run(const Config &cfg, const std::vector<std::string> &args, const s
     return 1;
 }
 
-int Runner::run_shell(const Config &cfg) {
-    std::string shell_bin = "/bin/sh";
-    if (utils::file_exists("/bin/bash")) {
-        shell_bin = "/bin/bash";
+int Runner::run_shell(const Config &cfg, const std::vector<std::string> &shell_args) {
+    // Resolve the shell through the isolated PATH after entering fglibc;
+    // an absolute host /bin/bash can still select Alpine's musl binary.
+    std::string shell_bin = "sh";
+    if (utils::file_exists(cfg.sysroot_dir + "/usr/bin/bash") ||
+        utils::file_exists(cfg.sysroot_dir + "/bin/bash")) {
+        shell_bin = "bash";
     }
-
-    std::cout << utils::colors::CYAN << utils::colors::BOLD
-              << "\n=== Entering fglibc Interactive Shell ===\n"
-              << "Type 'exit' to return to host Alpine environment.\n"
-              << utils::colors::RESET << std::endl;
-
-    std::vector<std::string> args = { shell_bin };
+    std::vector<std::string> args;
+    if (!shell_args.empty() && !shell_args[0].empty() && shell_args[0][0] != '-') {
+        shell_bin = shell_args[0];
+        args.assign(shell_args.begin(), shell_args.end());
+    } else {
+        args.push_back(shell_bin);
+        args.insert(args.end(), shell_args.begin(), shell_args.end());
+    }
     return run(cfg, args);
 }
 
@@ -196,6 +201,21 @@ int Runner::run_namespace_engine(const Config &cfg, const std::vector<std::strin
     mount("/oldroot/home", "/home", NULL, MS_BIND | MS_REC, NULL);
     mount("/oldroot/root", "/root", NULL, MS_BIND | MS_REC, NULL);
     mount("/oldroot/sbin", "/sbin", NULL, MS_BIND | MS_REC, NULL);
+
+    // If Flatpak Steam private shm exists, bind-mount it to /dev/shm so Steam IPC shared memory works
+    DIR *shm_dir = opendir("/oldroot/dev/shm");
+    if (shm_dir) {
+        struct dirent *ent;
+        while ((ent = readdir(shm_dir)) != nullptr) {
+            std::string name = ent->d_name;
+            if (name.find("flatpak-com.valvesoftware.Steam") == 0) {
+                std::string fpshm = "/oldroot/dev/shm/" + name;
+                mount(fpshm.c_str(), "/dev/shm", NULL, MS_BIND, NULL);
+                break;
+            }
+        }
+        closedir(shm_dir);
+    }
     std::string old_sysroot = std::string("/oldroot") + cfg.sysroot_dir;
 
     // Overlay /var with sysroot/var (pacman db, cache)
@@ -258,12 +278,9 @@ int Runner::run_namespace_engine(const Config &cfg, const std::vector<std::strin
     }
 
     // Mount /opt if exists
-    if (utils::dir_exists(old_sysroot + "/opt") && utils::dir_exists("/oldroot/opt")) {
-        std::string ovl_opt = "lowerdir=" + old_sysroot + "/opt:/oldroot/opt";
-        if (mount("overlay", "/opt", "overlay", 0, ovl_opt.c_str()) < 0) {
-            mount((old_sysroot + "/opt").c_str(), "/opt", NULL, MS_BIND | MS_REC, NULL);
-        }
-    } else if (utils::dir_exists(old_sysroot + "/opt")) {
+    // /opt is package data and must remain writable. A lowerdir-only overlay
+    // is read-only and was the source of "Read-only file system" failures.
+    if (utils::dir_exists(old_sysroot + "/opt")) {
         mount((old_sysroot + "/opt").c_str(), "/opt", NULL, MS_BIND | MS_REC, NULL);
     }
 
@@ -320,10 +337,11 @@ int Runner::run_namespace_engine(const Config &cfg, const std::vector<std::strin
     setenv("LIBGL_DRIVERS_PATH", "/lib64/dri", 1);
     setenv("PS1", "[fglibc-env] \\w $ ", 1);
 
+    // Never inherit host Alpine paths: their binaries are linked against musl.
+    // Commands must resolve to the glibc sysroot (or to the shell built into it).
     std::string new_path = "/usr/local/bin:/usr/bin:/bin";
-    const char *cur_path = getenv("PATH");
-    if (cur_path && *cur_path) {
-        new_path += ":" + std::string(cur_path);
+    if (utils::dir_exists(cfg.sysroot_dir + "/usr/local/bin")) {
+        new_path = cfg.sysroot_dir + "/usr/local/bin:" + new_path;
     }
     new_path = cfg.sysroot_dir + "/usr/bin:" + cfg.sysroot_dir + "/bin:" + new_path;
     setenv("PATH", new_path.c_str(), 1);
@@ -334,16 +352,9 @@ int Runner::run_namespace_engine(const Config &cfg, const std::vector<std::strin
         setenv("__EGL_VENDOR_LIBRARY_DIRS", (cfg.sysroot_dir + "/usr/share/glvnd/egl_vendor.d").c_str(), 1);
     }
 
-    if (!cfg.custom_library_path.empty()) {
-        const char *cur_lp = getenv("LD_LIBRARY_PATH");
-        std::string new_lp = cfg.custom_library_path;
-        if (cur_lp && *cur_lp) {
-            new_lp += ":" + std::string(cur_lp);
-        }
-        setenv("LD_LIBRARY_PATH", new_lp.c_str(), 1);
-    } else {
-        unsetenv("LD_LIBRARY_PATH");
-    }
+    std::string new_lp = cfg.sysroot_dir + "/usr/lib:" + cfg.sysroot_dir + "/lib64:" + cfg.sysroot_dir + "/lib";
+    if (!cfg.custom_library_path.empty()) new_lp = cfg.custom_library_path + ":" + new_lp;
+    setenv("LD_LIBRARY_PATH", new_lp.c_str(), 1);
 
     std::vector<char *> exec_argv;
     for (const auto &arg : args) {
@@ -372,6 +383,10 @@ int Runner::run_bwrap_engine(const Config &cfg, const std::vector<std::string> &
         "--dev", "/dev",
         "--proc", "/proc",
         "--ro-bind", cfg.sysroot_dir + "/usr/lib", "/lib64",
+        "--bind", cfg.sysroot_dir + "/usr/bin", "/usr/bin",
+        "--bind", cfg.sysroot_dir + "/bin", "/bin",
+        "--bind", cfg.sysroot_dir + "/etc", "/etc",
+        "--bind", cfg.sysroot_dir + "/opt", "/opt",
         "--bind", "/tmp", "/tmp",
         "--bind", utils::get_home_dir(), utils::get_home_dir(),
         "--chdir", target_cwd
@@ -394,7 +409,10 @@ int Runner::run_bwrap_engine(const Config &cfg, const std::vector<std::string> &
     cmd.push_back("1");
     cmd.push_back("--setenv");
     cmd.push_back("LD_LIBRARY_PATH");
-    cmd.push_back("/lib64");
+    cmd.push_back("/lib64:/usr/lib:/lib");
+    cmd.push_back("--setenv");
+    cmd.push_back("PATH");
+    cmd.push_back("/usr/local/bin:/usr/bin:/bin");
 
     for (const auto &a : args) {
         cmd.push_back(a);

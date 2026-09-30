@@ -22,10 +22,7 @@ struct PackageBundle {
 
 class InstallerUI {
 public:
-    // Run the interactive checkbox/search TUI for packages
-    static int run_interactive(const Config &cfg);
-
-    // Run setup (interactive TUI or CLI component setup)
+    // Run setup for explicitly selected components.
     static int run_setup(const Config &cfg, const std::vector<std::string> &args = {});
 
     // Benchmark and rank fastest mirrors, writing to pacman.d/mirrorlist

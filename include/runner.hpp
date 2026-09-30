@@ -9,7 +9,7 @@ namespace fglibc {
 class Runner {
 public:
     static int run(const Config &cfg, const std::vector<std::string> &args, const std::string &custom_cwd = "");
-    static int run_shell(const Config &cfg);
+    static int run_shell(const Config &cfg, const std::vector<std::string> &shell_args = {});
 
 private:
     static int run_namespace_engine(const Config &cfg, const std::vector<std::string> &args, const std::string &target_cwd);

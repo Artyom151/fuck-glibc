@@ -95,6 +95,9 @@ void Config::ensure_prefix_dirs() const {
     utils::create_dirs(sysroot_dir);
     utils::create_dirs(sysroot_dir + "/usr/lib");
     utils::create_dirs(sysroot_dir + "/usr/bin");
+    utils::create_dirs(sysroot_dir + "/usr/local/bin");
+    utils::create_dirs(sysroot_dir + "/bin");
+    utils::create_dirs(sysroot_dir + "/opt");
     utils::create_dirs(sysroot_dir + "/lib64");
     utils::create_dirs(sysroot_dir + "/lib");
     utils::create_dirs(sysroot_dir + "/etc");

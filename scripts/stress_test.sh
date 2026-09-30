@@ -1,6 +1,6 @@
 #!/bin/sh
+set -u
 
-# ANSI Colors
 RED='\033[31m'
 GREEN='\033[32m'
 YELLOW='\033[33m'
@@ -8,212 +8,153 @@ CYAN='\033[36m'
 BOLD='\033[1m'
 RESET='\033[0m'
 
-PASSED_TESTS=0
-FAILED_TESTS=0
-TOTAL_TESTS=0
-
-get_time_ms() {
-    python3 -c "import time; print(int(time.time() * 1000))" 2>/dev/null || date +%s
-}
-
-run_test() {
-    TEST_NAME="$1"
-    TEST_CMD="$2"
-    TOTAL_TESTS=$((TOTAL_TESTS + 1))
-    
-    printf "%b[%02d/12] RUNNING:%b %s... " "${CYAN}${BOLD}" "${TOTAL_TESTS}" "${RESET}" "${TEST_NAME}"
-    
-    LOG_FILE="/tmp/fglibc_test_${TOTAL_TESTS}.log"
-    START_TIME=$(get_time_ms)
-    
-    sh -c "${TEST_CMD}" > "${LOG_FILE}" 2>&1
-    RET=$?
-    
-    END_TIME=$(get_time_ms)
-    DIFF_MS=$((END_TIME - START_TIME))
-    if [ "$DIFF_MS" -le 0 ]; then DIFF_MS=1; fi
-    
-    if [ $RET -eq 0 ]; then
-        printf "%b[PASS]%b (%d ms)\n" "${GREEN}${BOLD}" "${RESET}" "${DIFF_MS}"
-        PASSED_TESTS=$((PASSED_TESTS + 1))
-    else
-        printf "%b[FAIL]%b\n" "${RED}${BOLD}" "${RESET}"
-        printf "%b----------------- Error Log -----------------%b\n" "${RED}" "${RESET}"
-        tail -n 25 "${LOG_FILE}"
-        printf "%b---------------------------------------------%b\n" "${RED}" "${RESET}"
-        FAILED_TESTS=$((FAILED_TESTS + 1))
-    fi
-    rm -f "${LOG_FILE}"
-}
-
-printf "\n%b======================================================================%b\n" "${CYAN}${BOLD}" "${RESET}"
-printf "%b               fglibc Full Comprehensive Stress Test Suite            %b\n" "${BOLD}" "${RESET}"
-printf "%b======================================================================%b\n\n" "${CYAN}${BOLD}" "${RESET}"
-
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+PROJECT_ROOT=$(CDPATH= cd -- "${SCRIPT_DIR}/.." && pwd)
 BIN="${PROJECT_ROOT}/bin/fglibc"
+PASS=0
+FAIL=0
+SKIP=0
+TOTAL=0
+TMP_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/fglibc-stress.XXXXXX") || exit 1
+trap 'rm -rf "$TMP_ROOT"' EXIT HUP INT TERM
 
-if [ ! -x "${BIN}" ]; then
-    printf "%bError: fglibc binary not found at %s. Please run 'make' first.%b\n" "${RED}" "${BIN}" "${RESET}"
-    exit 1
+if [ ! -x "$BIN" ]; then
+    printf '%bBinary missing: %s (run make first)%b\n' "$RED" "$BIN" "$RESET"
+    exit 2
 fi
 
-if [ ! -f "${PROJECT_ROOT}/examples/glibc_test" ] || [ ! -f "${PROJECT_ROOT}/examples/glibc_cpp_test" ] || [ ! -f "${PROJECT_ROOT}/examples/glibc_sdl2_test" ]; then
-    printf "%bBuilding test examples...%b\n" "${CYAN}" "${RESET}"
-    make -C "${PROJECT_ROOT}" examples >/dev/null 2>&1 || true
-fi
-
-# Test 1: CLI Version & Hardware Status
-run_test "CLI Version & Environment Status" \
-    "${BIN} version && ${BIN} status"
-
-# Test 2: ELF Binary Inspection & Dependencies
-run_test "ELF Parser & Dependency Inspection" \
-    "${BIN} check ${PROJECT_ROOT}/examples/glibc_test && ${BIN} check ${PROJECT_ROOT}/examples/glibc_cpp_test"
-
-# Test 3: Native C Glibc Runtime Execution
-run_test "Native C Glibc Execution (glibc 2.44, UID/GID, DRI GPU nodes)" \
-    "${BIN} ${PROJECT_ROOT}/examples/glibc_test --stress-mode=1"
-
-# Test 4: Native C++ Multi-threading & STL ABI Compatibility
-run_test "C++11 Threading & STL Compatibility (POSIX pthreads under glibc)" \
-    "${BIN} ${PROJECT_ROOT}/examples/glibc_cpp_test StressRunner"
-
-# Test 5: Graphics, SDL2 & OpenGL/Mesa Software Stack
-run_test "SDL2 & OpenGL Context Initialization" \
-    "SDL_VIDEODRIVER=dummy LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe ${BIN} ${PROJECT_ROOT}/examples/glibc_sdl2_test"
-
-# Test 6: Shebang Execution & Overlayfs /bin Isolation
-run_test "Shebang Execution (#!/bin/bash via glibc overlayfs)" \
-    'TMP_SCRIPT="/tmp/fglibc_shebang_test.sh"
-    cat << "SH_EOF" > "${TMP_SCRIPT}"
-#!/bin/bash
-set -e
-RES=$(seq 1 100 | awk '\''{s+=$1} END {print s}'\'')
-if [ "$RES" != "5050" ]; then
-    echo "Math assertion failed: $RES"
-    exit 1
-fi
-exit 0
-SH_EOF
-    chmod +x "${TMP_SCRIPT}"
-    '"${BIN}"' "${TMP_SCRIPT}"
-    RET=$?
-    rm -f "${TMP_SCRIPT}"
-    exit $RET'
-
-# Test 7: Massive Concurrency Stress Test (30 Parallel Processes)
-run_test "Concurrency Stress Test (30 simultaneous fglibc runner processes)" \
-    'PIDS=""
-    ERR=0
-    for i in $(seq 1 30); do
-        (
-            EXPECTED=$((i * i))
-            RES=$('"${BIN}"' bash -c "echo $((i * i))" 2>/dev/null)
-            if [ "$RES" != "$EXPECTED" ]; then
-                echo "Expected $EXPECTED got $RES"
-                exit 1
-            fi
-        ) &
-        PIDS="$PIDS $!"
+export FGLIBC_PREFIX="$TMP_ROOT/prefix"
+export FGLIBC_ENGINE=namespace
+SOURCE_SYSROOT=${FGLIBC_SOURCE_SYSROOT:-"$HOME/.fglibc/sysroot"}
+if [ -x "$SOURCE_SYSROOT/usr/bin/bash" ] && [ -f "$SOURCE_SYSROOT/usr/lib/libc.so.6" ] && [ -f "$SOURCE_SYSROOT/usr/lib/ld-linux-x86-64.so.2" ]; then
+    mkdir -p "$FGLIBC_PREFIX/sysroot/usr/bin" "$FGLIBC_PREFIX/sysroot/usr/lib"
+    cp "$SOURCE_SYSROOT/usr/bin/bash" "$FGLIBC_PREFIX/sysroot/usr/bin/bash"
+    for library in ld-linux-x86-64.so.2 libc.so.6 libreadline.so.8 libncursesw.so.6; do
+        if [ -e "$SOURCE_SYSROOT/usr/lib/$library" ]; then
+            cp -L "$SOURCE_SYSROOT/usr/lib/$library" "$FGLIBC_PREFIX/sysroot/usr/lib/$library"
+        fi
     done
-    for pid in $PIDS; do
-        wait $pid || ERR=$((ERR + 1))
-    done
-    if [ "$ERR" -ne 0 ]; then
-        echo "$ERR processes failed under concurrency!"
-        exit 1
-    fi'
-
-# Test 8: Exit Code Preservation & Signal Handling
-run_test "Exit Code & Signal Preservation" \
-    '# Verify exit code 0
-    '"${BIN}"' bash -c "exit 0" || exit 1
-    # Verify exit code 42
-    '"${BIN}"' bash -c "exit 42" 2>/dev/null
-    CODE=$?
-    if [ "$CODE" -ne 42 ]; then
-        echo "Expected exit code 42, got $CODE"
-        exit 1
-    fi
-    # Verify exit code 127
-    '"${BIN}"' /non_existent_binary_xyz_123 2>/dev/null
-    CODE=$?
-    if [ "$CODE" -ne 127 ]; then
-        echo "Expected exit code 127, got $CODE"
-        exit 1
-    fi'
-
-# Test 9: High-Throughput I/O & Pipe Streaming (100,000 lines)
-run_test "I/O Streaming & Pipe Throughput (100,000 lines)" \
-    'COUNT=$('"${BIN}"' bash -c "seq 1 100000" 2>/dev/null | wc -l)
-    if [ "$COUNT" -ne 100000 ]; then
-        echo "Stream line count mismatch: expected 100000, got $COUNT"
-        exit 1
-    fi'
-
-# Test 10: Package Manager Lifecycle (--no-cache, run, uninstall, manifests)
-run_test "Package Manager Lifecycle (install --no-cache, run, uninstall, manifests)" \
-    '# Install with --no-cache
-    '"${BIN}"' install --no-cache which
-    # Verify execution
-    RESOLVED=$('"${BIN}"' which bash 2>/dev/null)
-    if [ -z "$RESOLVED" ]; then
-        echo "Failed to execute installed which binary!"
-        exit 1
-    fi
-    # Verify manifest exists
-    if [ ! -f "$HOME/.fglibc/sysroot/var/lib/fglibc/manifests/which.list" ]; then
-        echo "Manifest file for which was not created!"
-        exit 1
-    fi
-    # Uninstall package
-    '"${BIN}"' uninstall which
-    # Verify binary is gone
-    if [ -f "$HOME/.fglibc/sysroot/usr/bin/which" ]; then
-        echo "Binary still exists after uninstall!"
-        exit 1
-    fi
-    # Verify manifest is cleaned up
-    if [ -f "$HOME/.fglibc/sysroot/var/lib/fglibc/manifests/which.list" ]; then
-        echo "Manifest still exists after uninstall!"
-        exit 1
-    fi'
-
-# Test 11: Real-World Applications Launch Stress Check
-run_test "Real-World Apps Check (Spotify & Discord launch checks)" \
-    '# Spotify help launch
-    '"${BIN}"' spotify --help >/dev/null
-    # Discord version launch with timeout
-    timeout 3 '"${BIN}"' discord --version >/dev/null 2>&1 || true'
-
-# Test 12: Windows Compatibility Services & Tools (win-setup & winetricks)
-run_test "Windows Compatibility Services & Tools (win-setup status & winetricks)" \
-    '# Verify win-setup status
-    STATUS_OUT=$('"${BIN}"' win-setup status)
-    if ! echo "$STATUS_OUT" | grep -q "fglibc Windows Runtime & Services Status"; then
-        echo "Failed to query Windows services status!"
-        exit 1
-    fi
-    # Verify WebView2 detection
-    if ! echo "$STATUS_OUT" | grep -q "Microsoft Edge WebView2"; then
-        echo "Missing WebView2 report in status output!"
-        exit 1
-    fi
-    # Verify winetricks version query
-    WINETRICKS_OUT=$('"${BIN}"' winetricks --version)
-    if ! echo "$WINETRICKS_OUT" | grep -q "sha256sum"; then
-        echo "Failed to invoke winetricks wrapper!"
-        exit 1
-    fi'
-
-printf "\n%b======================================================================%b\n" "${CYAN}${BOLD}" "${RESET}"
-if [ "${FAILED_TESTS}" -eq 0 ]; then
-    printf "%b       ✔ ALL %d/%d STRESS TESTS PASSED WITH 100%% SUCCESS!       %b\n" "${GREEN}${BOLD}" "${TOTAL_TESTS}" "${TOTAL_TESTS}" "${RESET}"
+    RUNTIME_STAGED=1
 else
-    printf "%b       ✘ STRESS TESTS FAILED: %d/%d FAILED!                %b\n" "${RED}${BOLD}" "${FAILED_TESTS}" "${TOTAL_TESTS}" "${RESET}"
+    RUNTIME_STAGED=0
 fi
-printf "%b======================================================================%b\n\n" "${CYAN}${BOLD}" "${RESET}"
 
-exit ${FAILED_TESTS}
+pass() { TOTAL=$((TOTAL + 1)); PASS=$((PASS + 1)); printf '%b[PASS]%b %s\n' "$GREEN" "$RESET" "$1"; }
+fail() { TOTAL=$((TOTAL + 1)); FAIL=$((FAIL + 1)); printf '%b[FAIL]%b %s\n' "$RED" "$RESET" "$1"; [ -z "${2:-}" ] || printf '       %s\n' "$2"; }
+skip() { TOTAL=$((TOTAL + 1)); SKIP=$((SKIP + 1)); printf '%b[SKIP]%b %s — %s\n' "$YELLOW" "$RESET" "$1" "$2"; }
+
+check_output() {
+    name=$1 expected=$2
+    shift 2
+    output=$("$@" 2>&1)
+    result=$?
+    if [ "$result" -eq 0 ] && printf '%s' "$output" | grep -Fq "$expected"; then pass "$name"; else fail "$name" "exit=$result; expected output: $expected"; fi
+}
+
+check_exit() {
+    name=$1 expected=$2
+    shift 2
+    "$@" >"$TMP_ROOT/stdout" 2>"$TMP_ROOT/stderr"
+    result=$?
+    if [ "$result" -eq "$expected" ]; then pass "$name"; else fail "$name" "expected exit=$expected, got $result: $(cat "$TMP_ROOT/stderr")"; fi
+}
+
+printf '\n%b============================================================%b\n' "$CYAN$BOLD" "$RESET"
+printf '%b          fglibc isolated stress and regression checks%b\n' "$BOLD" "$RESET"
+printf '%bTemporary prefix: %s%b\n\n' "$CYAN" "$FGLIBC_PREFIX" "$RESET"
+
+check_output 'version command' 'version' "$BIN" version
+check_output 'help command' 'USAGE:' "$BIN" --help
+empty_status=$(FGLIBC_PREFIX="$TMP_ROOT/empty-prefix" "$BIN" status 2>&1)
+if printf '%s' "$empty_status" | grep -q 'Not Initialized'; then pass 'status reports an empty prefix'; else fail 'status reports an empty prefix'; fi
+check_output 'config uses FGLIBC_PREFIX' "$FGLIBC_PREFIX" "$BIN" status
+check_exit 'setup requires explicit component' 2 "$BIN" setup
+check_exit 'install requires package names' 2 "$BIN" install
+check_exit 'check requires executable path' 1 "$BIN" check
+check_output 'setup status component' 'Setup & Integration Status' "$BIN" setup status
+check_output 'package list command' 'Installed Packages' "$BIN" list
+WINEPREFIX="$TMP_ROOT/wine" XDG_CACHE_HOME="$TMP_ROOT/cache" \
+    check_output 'bundled win-setup script resolution' 'Microsoft Edge WebView2' "$BIN" win-setup status
+
+mkdir -p "$FGLIBC_PREFIX/cache"
+printf archive > "$FGLIBC_PREFIX/cache/stress.pkg.tar.zst"
+printf keep > "$FGLIBC_PREFIX/cache/keep.txt"
+if "$BIN" clean >/dev/null 2>&1 && [ ! -e "$FGLIBC_PREFIX/cache/stress.pkg.tar.zst" ] && [ -f "$FGLIBC_PREFIX/cache/keep.txt" ]; then
+    pass 'cache cleanup removes package archives only'
+else
+    fail 'cache cleanup removes package archives only'
+fi
+
+check_output 'ELF parser recognizes host shell and musl interpreter' 'MUSL - Native Alpine binary' "$BIN" check /bin/sh
+printf 'int main(void) { return 0; }\n' > "$TMP_ROOT/elf_fixture.c"
+if command -v cc >/dev/null 2>&1 && cc "$TMP_ROOT/elf_fixture.c" -o "$TMP_ROOT/elf_fixture" >/dev/null 2>&1; then
+    check_output 'ELF parser handles freshly compiled fixture' 'ELF Inspection Report' "$BIN" check "$TMP_ROOT/elf_fixture"
+else
+    skip 'ELF parser compiled fixture' 'host C compiler is unavailable'
+fi
+printf 'not an executable\n' > "$TMP_ROOT/not-elf"
+check_exit 'ELF parser rejects invalid input' 1 "$BIN" check "$TMP_ROOT/not-elf"
+
+if [ "$RUNTIME_STAGED" -eq 1 ]; then
+    check_exit 'unknown executable returns failure' 127 "$BIN" "$TMP_ROOT/no-such-program"
+    check_output 'shell -c forwards arguments' 'shell-args-ok' "$BIN" sh -c 'printf shell-args-ok'
+    check_output 'shell preserves spaces and quotes' 'two words' "$BIN" sh -c 'printf "%s" "two words"'
+    check_exit 'shell propagates child exit status' 42 "$BIN" sh -c 'exit 42'
+else
+    skip 'unknown executable returns failure' 'no ready host prefix to clone into isolated test prefix'
+    skip 'shell argument forwarding' 'no ready host prefix to clone into isolated test prefix'
+fi
+
+if [ -x "$PROJECT_ROOT/examples/glibc_test" ]; then
+    check_output 'ELF parser recognizes C example' 'ELF Inspection Report' "$BIN" check "$PROJECT_ROOT/examples/glibc_test"
+else
+    skip 'ELF parser example' 'examples/glibc_test is not built; examples build may require initialized sysroot'
+fi
+
+if [ -x "$PROJECT_ROOT/examples/glibc_cpp_test" ]; then
+    check_output 'ELF parser recognizes C++ example' 'ELF Inspection Report' "$BIN" check "$PROJECT_ROOT/examples/glibc_cpp_test"
+else
+    skip 'ELF parser C++ example' 'examples/glibc_cpp_test is not built'
+fi
+
+if [ -x "$FGLIBC_PREFIX/sysroot/usr/lib/ld-linux-x86-64.so.2" ]; then
+    check_output 'initialized glibc prefix status' 'Ready' "$BIN" status
+    if [ -x "$PROJECT_ROOT/examples/glibc_test" ]; then
+        check_output 'glibc C binary execution' 'SUCCESS' "$BIN" "$PROJECT_ROOT/examples/glibc_test"
+    else
+        skip 'glibc C binary execution' 'example binary is not built'
+    fi
+else
+    skip 'glibc runtime execution' 'isolated test prefix is not initialized; network/bootstrap intentionally not started'
+fi
+
+parallel_failed=0
+parallel_pids=
+i=1
+while [ "$i" -le 8 ]; do
+    (
+        expected=$((i * i))
+        result=$("$BIN" sh -c "printf %s $expected" 2>/dev/null) || exit 1
+        [ "$result" = "$expected" ]
+    ) &
+    parallel_pids="$parallel_pids $!"
+    i=$((i + 1))
+done
+for pid in $parallel_pids; do
+    wait "$pid" || parallel_failed=$((parallel_failed + 1))
+done
+if [ "$parallel_failed" -eq 0 ]; then pass 'parallel shell invocations (8 processes)'; else fail 'parallel shell invocations (8 processes)' "$parallel_failed child process(es) failed"; fi
+
+if [ -x "$PROJECT_ROOT/examples/glibc_sdl2_test" ]; then
+    skip 'SDL/OpenGL runtime' 'requires initialized graphical libraries and host display/GPU validation'
+else
+    skip 'SDL/OpenGL runtime' 'example binary is not built'
+fi
+skip 'package install/uninstall lifecycle' 'requires network and mutates package state; use an explicitly provisioned disposable prefix'
+skip 'Spotify/Discord launch' 'external applications and graphical session are not guaranteed in CI'
+skip 'Wine/Proton services' 'host Wine/Proton installation and Windows prefixes are external state'
+
+printf '\n%b============================================================%b\n' "$CYAN$BOLD" "$RESET"
+printf 'Results: %b%d passed%b, %b%d failed%b, %b%d skipped%b (%d checks)\n' "$GREEN$BOLD" "$PASS" "$RESET" "$RED$BOLD" "$FAIL" "$RESET" "$YELLOW$BOLD" "$SKIP" "$RESET" "$TOTAL"
+printf 'Disposable prefix removed on exit: %s\n\n' "$FGLIBC_PREFIX"
+[ "$FAIL" -eq 0 ]

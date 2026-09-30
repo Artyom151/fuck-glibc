@@ -2,7 +2,11 @@
 #include <vector>
 #include <string>
 #include <cstdlib>
+#include <cerrno>
 #include <unistd.h>
+#include <sys/wait.h>
+#include <limits.h>
+#include <filesystem>
 #include "config.hpp"
 #include "runner.hpp"
 #include "bootstrap.hpp"
@@ -11,6 +15,50 @@
 #include "utils.hpp"
 
 using namespace fglibc;
+
+static std::string find_script(const char *argv0, const std::string &name) {
+    std::vector<std::string> candidates;
+    char resolved[PATH_MAX];
+    if (realpath(argv0, resolved)) {
+        std::filesystem::path exe(resolved);
+        candidates.push_back((exe.parent_path().parent_path() / "scripts" / name).string());
+        candidates.push_back((exe.parent_path() / "scripts" / name).string());
+    }
+    candidates.push_back((std::filesystem::current_path() / "scripts" / name).string());
+    for (const auto &candidate : candidates) {
+        if (utils::file_exists(candidate)) return candidate;
+    }
+    return {};
+}
+
+static int run_script(const char *argv0, const std::string &name, int argc, char **argv, int first_arg) {
+    const std::string path = find_script(argv0, name);
+    if (path.empty()) {
+        utils::log_error("Could not locate bundled script: scripts/" + name);
+        return 1;
+    }
+    std::vector<std::string> args = {"sh", path};
+    for (int i = first_arg; i < argc; ++i) args.emplace_back(argv[i]);
+    pid_t child = fork();
+    if (child < 0) return 1;
+    if (child == 0) {
+        std::vector<char *> raw;
+        for (auto &arg : args) raw.push_back(arg.data());
+        raw.push_back(nullptr);
+        execvp(raw[0], raw.data());
+        _exit(127);
+    }
+    int status = 0;
+    pid_t waited;
+    do {
+        waited = waitpid(child, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+    if (waited < 0) {
+        utils::log_error("waitpid failed while running scripts/" + name);
+        return 1;
+    }
+    return WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
+}
 
 static void print_version() {
     std::cout << utils::colors::CYAN << utils::colors::BOLD
@@ -27,13 +75,12 @@ static void print_help(const char *prog_name) {
               << "  " << CYAN << prog_name << " run <executable> [args...]" << RESET << "             Run a program in glibc environment\n"
               << "  " << CYAN << prog_name << " win-setup <component>" << RESET << "                  Install Windows runtimes (webview2, vcrun, dxvk, fonts)\n"
               << "  " << CYAN << prog_name << " winetricks [verb...]" << RESET << "                   Run winetricks to install Windows libraries/fonts\n"
-              << "  " << CYAN << prog_name << " shell" << RESET << "                                  Enter an interactive glibc shell\n"
+              << "  " << CYAN << prog_name << " shell [args...]" << RESET << "                    Run a shell inside the glibc environment\n"
               << "  " << CYAN << prog_name << " check <executable>" << RESET << "                     Inspect ELF or PE binary and check dependencies\n"
-              << "  " << CYAN << prog_name << " setup [component]" << RESET << "                    Interactive package managers, mirrors & desktop setup\n"
+              << "  " << CYAN << prog_name << " setup <component...>" << RESET << "                 Configure explicitly selected components\n"
               << "  " << CYAN << prog_name << " sync-desktop" << RESET << "                          Export apps & icons to KDE, GNOME, Hyprland, Rofi\n"
               << "  " << CYAN << prog_name << " mirrors" << RESET << "                               Benchmark & select fastest Arch Linux mirrors\n"
               << "  " << CYAN << prog_name << " init [--gaming]" << RESET << "                        Initialize or reset the glibc runtime prefix\n"
-              << "  " << CYAN << prog_name << " install" << RESET << "                                Interactive package manager & library installer\n"
               << "  " << CYAN << prog_name << " install [--no-cache] <pkg...>" << RESET << "          Install packages from Arch Linux repositories\n"
               << "  " << CYAN << prog_name << " install gaming" << RESET << "                         Install complete gaming stack (Mesa, Vulkan, SDL)\n"
               << "  " << CYAN << prog_name << " install <archive.pkg.tar.zst>" << RESET << "          Install a local package archive into prefix\n"
@@ -45,7 +92,7 @@ static void print_help(const char *prog_name) {
               << "  " << CYAN << prog_name << " help" << RESET << "                                   Display this help message\n"
               << "  " << CYAN << prog_name << " version" << RESET << "                                Display version information\n\n"
               << BOLD << "PACKAGE MANAGERS & SETUP (setup):" << RESET << "\n"
-              << "  " << CYAN << "all" << RESET << "       Run comprehensive setup (mirrors, pacman, yay, paru, devel, desktop)\n"
+              << "  " << CYAN << "all" << RESET << "       Run all setup steps (explicit opt-in)\n"
               << "  " << CYAN << "mirrors" << RESET << "   Benchmark & rank fastest mirrors (latency test)\n"
               << "  " << CYAN << "desktop" << RESET << "   Export and sync desktop shortcuts & icons (KDE, GNOME, Hyprland, Rofi)\n"
               << "  " << CYAN << "pacman" << RESET << "    Configure Pacman package manager & local ALPM database\n"
@@ -68,7 +115,7 @@ static void print_help(const char *prog_name) {
               << "  fglibc discord\n"
               << "  fglibc launcher.exe\n\n"
               << "  # Setup package managers & desktop integration:\n"
-              << "  fglibc setup\n"
+              << "  fglibc setup all\n"
               << "  fglibc setup mirrors\n"
               << "  fglibc sync-desktop\n\n"
               << "  # Setup Windows runtimes:\n"
@@ -113,6 +160,10 @@ int main(int argc, char **argv) {
         for (int i = 2; i < argc; ++i) {
             setup_args.push_back(argv[i]);
         }
+        if (setup_args.empty()) {
+            utils::log_error("Usage: fglibc setup <all|mirrors|desktop|pacman|yay|paru|apt|apk|devel|status>");
+            return 2;
+        }
         return InstallerUI::run_setup(cfg, setup_args);
     }
 
@@ -150,38 +201,15 @@ int main(int argc, char **argv) {
     }
 
     if (cmd == "test" || cmd == "stress-test") {
-        std::string test_script = "/home/runtime/coding/fuck-glibc/scripts/stress_test.sh";
-        if (!utils::file_exists(test_script)) {
-            test_script = "./scripts/stress_test.sh";
-        }
-        std::string cmd_run = "sh \"" + test_script + "\"";
-        return utils::run_command(cmd_run);
+        return run_script(argv[0], "stress_test.sh", argc, argv, argc);
     }
 
     if (cmd == "win-setup" || cmd == "windows-setup" || cmd == "win" || cmd == "windows") {
-        std::string script_path = "/home/runtime/coding/fuck-glibc/scripts/win_setup.sh";
-        if (!utils::file_exists(script_path)) {
-            script_path = "./scripts/win_setup.sh";
-        }
-        std::string args_str;
-        for (int i = 2; i < argc; ++i) {
-            args_str += " \"" + std::string(argv[i]) + "\"";
-        }
-        std::string cmd_run = "sh \"" + script_path + "\"" + args_str;
-        return utils::run_command(cmd_run);
+        return run_script(argv[0], "win_setup.sh", argc, argv, 2);
     }
 
     if (cmd == "winetricks" || cmd == "tricks") {
-        std::string script_path = "/home/runtime/coding/fuck-glibc/scripts/winetricks.sh";
-        if (!utils::file_exists(script_path)) {
-            script_path = "./scripts/winetricks.sh";
-        }
-        std::string args_str;
-        for (int i = 2; i < argc; ++i) {
-            args_str += " \"" + std::string(argv[i]) + "\"";
-        }
-        std::string cmd_run = "sh \"" + script_path + "\"" + args_str;
-        return utils::run_command(cmd_run);
+        return run_script(argv[0], "winetricks.sh", argc, argv, 2);
     }
 
     bool no_cache = false;
@@ -206,7 +234,8 @@ int main(int argc, char **argv) {
             }
         }
         if (pkgs.empty()) {
-            return InstallerUI::run_interactive(cfg);
+            utils::log_error("Usage: fglibc install [--no-cache] <package...>");
+            return 2;
         }
         std::string target = pkgs[0];
         if (target == "gaming" && pkgs.size() == 1) {
@@ -249,7 +278,9 @@ int main(int argc, char **argv) {
     }
 
     if (cmd == "shell" || cmd == "sh") {
-        return Runner::run_shell(cfg);
+        std::vector<std::string> shell_args;
+        for (int i = 2; i < argc; ++i) shell_args.emplace_back(argv[i]);
+        return Runner::run_shell(cfg, shell_args);
     }
 
     // Prepare run arguments
@@ -321,13 +352,14 @@ int main(int argc, char **argv) {
             std::string compat_data = utils::find_compat_data_for_game(target_bin);
 
             setenv("STEAM_COMPAT_CLIENT_INSTALL_PATH", steam_root.c_str(), 1);
+            std::string appid;
             if (!compat_data.empty()) {
                 setenv("STEAM_COMPAT_DATA_PATH", compat_data.c_str(), 1);
 
                 // Extract Steam AppID from compatdata path
                 size_t slash = compat_data.rfind('/');
                 if (slash != std::string::npos) {
-                    std::string appid = compat_data.substr(slash + 1);
+                    appid = compat_data.substr(slash + 1);
                     setenv("SteamAppId", appid.c_str(), 1);
                     setenv("SteamGameId", appid.c_str(), 1);
                     setenv("STEAM_COMPAT_APP_ID", appid.c_str(), 1);
@@ -345,11 +377,40 @@ int main(int argc, char **argv) {
             }
 
             // Ensure ~/.steam symlink exists to prevent lsteamclient assertion failure
-            std::string home_steam = utils::get_home_dir() + "//.steam";
+            std::string home_steam = utils::get_home_dir() + "/.steam";
             if (!utils::dir_exists(home_steam) && !utils::file_exists(home_steam)) {
                 std::string target_steam = utils::get_home_dir() + "/.var/app/com.valvesoftware.Steam/.steam";
                 if (utils::dir_exists(target_steam)) {
                     symlink(target_steam.c_str(), home_steam.c_str());
+                }
+            }
+
+            // Route through Steam client when game is managed by Steam (especially Flatpak Steam)
+            // to ensure proper IPC session, VAC anti-cheat, and avoid "stalled cross-thread pipe" assertions.
+            bool is_flatpak_steam = (target_bin.find("com.valvesoftware.Steam") != std::string::npos ||
+                                     steam_root.find("com.valvesoftware.Steam") != std::string::npos);
+            const char *force_direct = getenv("FGLIBC_DIRECT_PROTON");
+            if (!appid.empty() && (!force_direct || strcmp(force_direct, "1") != 0)) {
+                std::string extra_args;
+                for (size_t i = 1; i < run_args.size(); i++) {
+                    if (!extra_args.empty()) extra_args += " ";
+                    extra_args += run_args[i];
+                }
+                std::string uri = "steam://rungameid/" + appid;
+                if (!extra_args.empty()) {
+                    uri += "//" + extra_args;
+                }
+
+                if (is_flatpak_steam && utils::file_exists("/usr/bin/flatpak")) {
+                    utils::log_info("Detected Flatpak Steam game (AppID: " + appid + ").");
+                    utils::log_info("Routing launch through Steam client (ensures active IPC pipe & VAC session)...");
+                    std::string flatpak_cmd = "flatpak run com.valvesoftware.Steam \"" + uri + "\"";
+                    return utils::run_command(flatpak_cmd);
+                } else if (utils::file_exists("/usr/bin/steam") || utils::file_exists("/usr/local/bin/steam")) {
+                    utils::log_info("Detected Steam game (AppID: " + appid + ").");
+                    utils::log_info("Routing launch through Steam client (ensures active IPC pipe & VAC session)...");
+                    std::string steam_cmd = "steam \"" + uri + "\"";
+                    return utils::run_command(steam_cmd);
                 }
             }
 
